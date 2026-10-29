@@ -141,6 +141,9 @@ public class SwiftTwilioVoicePlugin: NSObject, FlutterPlugin,  FlutterStreamHand
                 return
             }
             self.accessToken = token;
+            // Always reply, or the awaiting Dart Future never completes. With no VoIP token
+            // yet, pushRegistry(_:didUpdate:for:) registers with this access token later.
+            result(true)
             guard let deviceToken = deviceToken else {
                 self.sendPhoneCallEvents(description: "LOG|Device token is nil. Cannot register for VoIP push notifications.", isError: false)
                 return
