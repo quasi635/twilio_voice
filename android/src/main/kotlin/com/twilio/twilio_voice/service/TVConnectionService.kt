@@ -11,6 +11,8 @@ import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.telecom.*
 import android.util.Log
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
@@ -46,6 +48,13 @@ class TVConnectionService : ConnectionService() {
         val TAG = "TwilioVoiceConnectionService"
 
         val activeConnections = HashMap<String, TVCallConnection>()
+
+        /**
+         * Supplies the token and parameters for calls placed from the system dialer through this
+         * app's phone account. When null, such calls fail as before.
+         */
+        @JvmStatic
+        var outgoingCallResolver: TVOutgoingCallResolver? = null
 
         /**
          * Pending [CallInvite]s awaiting a Connection, mapped to Call SID. CallInvites are accepted
@@ -646,7 +655,8 @@ class TVConnectionService : ConnectionService() {
         }
 
         val myBundle: Bundle = request?.extras?.getBundle(EXTRA_OUTGOING_PARAMS)
-            ?: return failedConnection("request is missing Bundle EXTRA_OUTGOING_PARAMS")
+            ?: return createDialerConnection(request)
+                ?: failedConnection("request is missing Bundle EXTRA_OUTGOING_PARAMS")
 
         val token: String = myBundle.getString(EXTRA_TOKEN)
             ?: return failedConnection("ACTION_PLACE_OUTGOING_CALL is missing String EXTRA_TOKEN")
@@ -672,16 +682,71 @@ class TVConnectionService : ConnectionService() {
         from?.let { params["From"] = it }
         to?.let { params["To"] = it }
 
-        // create connect options
+        val connection = createOutgoingConnection(to, params, request.extras)
+        connectOutgoing(connection, token, params)
+        return connection
+    }
+
+    /**
+     * A call placed from the system dialer through this app's phone account carries only the
+     * dialed `tel:` address, with no token or parameters. Holds the connection while
+     * [outgoingCallResolver] supplies them, then connects. Returns null when no resolver is set
+     * or the request is not a dialer call, so the caller falls back to a failed connection.
+     */
+    private fun createDialerConnection(request: ConnectionRequest?): Connection? {
+        val resolver = outgoingCallResolver ?: return null
+        val address = request?.address ?: return null
+        if (address.scheme != PhoneAccount.SCHEME_TEL) return null
+        val number = address.schemeSpecificPart?.takeIf { it.isNotBlank() } ?: return null
+        Log.d(TAG, "createDialerConnection: resolving dialer call to $number")
+
+        val params = HashMap<String, String>()
+        val connection = createOutgoingConnection(number, params, request.extras)
+        val mainHandler = Handler(Looper.getMainLooper())
+
+        fun fail(reason: String) {
+            Log.e(TAG, "createDialerConnection: $reason")
+            connection.setDisconnected(DisconnectCause(DisconnectCause.ERROR, reason))
+            connection.destroy()
+            sendBroadcastEvent(applicationContext, TVBroadcastReceiver.ACTION_CALL_ENDED, "")
+            onConnectionEnded(null)
+        }
+
+        resolver.resolve(applicationContext, number, object : TVOutgoingCallResolver.Callback {
+            override fun onResolved(call: TVResolvedCall) {
+                mainHandler.post {
+                    // The user may have hung up while the token was being fetched.
+                    if (connection.state == Connection.STATE_DISCONNECTED) return@post
+                    params.putAll(call.params)
+                    params["From"] = call.from
+                    params["To"] = call.to
+                    connectOutgoing(connection, call.token, params)
+                }
+            }
+
+            override fun onFailed(reason: String) {
+                mainHandler.post {
+                    if (connection.state != Connection.STATE_DISCONNECTED) fail(reason)
+                }
+            }
+        })
+        return connection
+    }
+
+    private fun connectOutgoing(connection: TVCallConnection, token: String, params: HashMap<String, String>) {
         val connectOptions = ConnectOptions.Builder(token)
             .params(params)
             .build()
+        connection.twilioCall = Voice.connect(applicationContext, connectOptions, connection)
+    }
 
+    /**
+     * Builds an outgoing connection with its listeners, without connecting it. To/From are read
+     * from [params] when the call starts ringing, so a dialer call can fill them in later.
+     */
+    private fun createOutgoingConnection(to: String?, params: HashMap<String, String>, extras: Bundle?): TVCallConnection {
         // create outgoing connection
         val connection = TVCallConnection(applicationContext)
-
-        // create Voice SDK call
-        connection.twilioCall = Voice.connect(applicationContext, connectOptions, connection)
 
         // create storage instance for call parameters
         val mStorage: Storage = StorageImpl(applicationContext)
@@ -693,7 +758,7 @@ class TVConnectionService : ConnectionService() {
                 val callSid = call.sid!!
 
                 // Resolve call parameters (raw connect() calls carry no explicit To/From)
-                val callParams = TVCallParametersImpl(mStorage, call, to ?: "", from ?: "", params)
+                val callParams = TVCallParametersImpl(mStorage, call, params["To"] ?: "", params["From"] ?: "", params)
                 connection.setCallParameters(callParams)
 
                 // If call is not attached, attach it
@@ -705,31 +770,16 @@ class TVConnectionService : ConnectionService() {
             }
         }
 
-
         // Set call disconnected listener, removes connection from active connections when call is disconnected
         val onCallInitializingDisconnectedListener: CompletionHandler<DisconnectCause> = CompletionHandler {
             connection.twilioCall?.let {
                 sendBroadcastEvent(applicationContext, TVBroadcastReceiver.ACTION_CALL_ENDED, it.sid ?: "", connection.extras)
                 onConnectionEnded(it.sid)
-            }
+            } ?: onConnectionEnded(null)
         }
-
-        // NOTE(cybex-dev): This could be used as an alternative to the [onCallInitializingDisconnectedListener],
-        // however in the case of a call being initialized followed by a local disconnect - the call only has a temporary SID.
-        // The call SID is set in the [attachCallEventListeners] method when the call is in a RINGING or CONNECTED state.
-        // Thus, using [onEvent] will pass through a null call handle which may not be a good design.
-//        val onEvent: ValueBundleChanged<String> = ValueBundleChanged { event: String?, extra: Bundle? ->
-//            if(event == TVBroadcastReceiver.ACTION_CALL_ENDED) {
-//                val callSid = connection.twilioCall?.sid;
-//                sendBroadcastEvent(applicationContext, event ?: "", callSid, extra)
-//                // This is a temporary solution since `isOnCall` returns true when there is an active ConnectionService, regardless of the source app. This also applies to SIM/Telecom calls.
-//                sendBroadcastCallHandle(applicationContext, extra?.getString(TVBroadcastReceiver.EXTRA_CALL_HANDLE))
-//            }
-//        }
 
         connection.setOnCallStateListener(onCallStateListener)
         connection.setOnCallDisconnected(onCallInitializingDisconnectedListener)
-//        connection.setOnCallEventListener(onEvent)
 
         // Set callername on initialization - if present.
         to?.takeIf { it.isNotEmpty() }?.let {
@@ -739,7 +789,7 @@ class TVConnectionService : ConnectionService() {
         connection.setInitializing()
 
         // Apply extras
-        connection.extras = request.extras
+        connection.extras = extras
 
         tryStartForegroundService()
 
